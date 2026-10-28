@@ -58,3 +58,26 @@ Tests (`tests/test_tokens.py`) prove:
 - the "head" variant puts it at index 0;
 - both tables are registered learnable parameters with the Eq. 4 shapes, and the
   initial values are small, non-zero and within the truncation bound.
+
+## Phase 3: the selective scan
+
+Built:
+- `vim/selective_scan.py`: one function, `selective_scan(x, delta, A, B, C) -> y`,
+  implementing Eq. 2 (h_t = A_bar h_{t-1} + B_bar x_t, y_t = C h_t) as an explicit
+  Python loop over the 65 tokens, i.e. Algorithm 1 lines 13-14 and 16-22.
+  A_bar = exp(Delta * A) (Eq. 1; Algorithm 1 line 13 is printed without the exp),
+  B_bar = Delta * B (the simplified discretisation used by Algorithm 1 line 14 and
+  the official Mamba code). Shapes: x, delta (Bt, 65, 384); A (384, 16);
+  B, C (Bt, 65, 16); y (Bt, 65, 384).
+- Comments cover the bucket-of-water picture, why A < 0, what "selective" means,
+  every unsqueeze/broadcast with its shapes, why the continuous form and Eq. 3
+  (global convolution) are not coded, and why the slow O(M) loop is kept
+  (the hardware-aware scan of Section 3.5 is out of scope).
+
+Tests (`tests/test_selective_scan.py`) prove:
+- the output shape equals the input shape (2, 65, 384);
+- with A very negative (A_bar = 0) each output depends only on its own token,
+  and equals x_t * sum_n(B_tn C_tn) exactly;
+- with A near zero (A_bar = 1) the state is a running sum (matches torch.cumsum);
+- a 2-token, 2-slot example worked out by hand gives y = [0.5, e^-1];
+- backward() gives finite, non-zero gradients to x, delta, A, B and C.
