@@ -1,0 +1,529 @@
+% =====================================================================================
+% Vision Mamba for Diabetic Retinopathy Grading -- project report
+%
+% Build (from the report/ folder):
+%     pdflatex main && bibtex main && pdflatex main && pdflatex main
+% or simply:
+%     latexmk -pdf main.tex
+%
+% Figures are read from report/figures/, produced by `python -m eval.plots`.
+% If a figure does not exist yet, a labelled placeholder box is drawn instead, so
+% the report always compiles.
+%
+% Every place that needs numbers from the real training run is marked with
+%     % TODO: fill in after training
+% =====================================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[numbers]{natbib}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+
+\graphicspath{{figures/}}
+
+% \maybefigure{file}{width}: include the figure if it exists, otherwise draw a
+% framed placeholder naming the command that creates it.
+\newcommand{\maybefigure}[2]{%
+  \IfFileExists{figures/#1}{%
+    \includegraphics[width=#2]{#1}%
+  }{%
+    \fbox{\parbox[c][4cm][c]{#2}{\centering\small\color{gray}
+      Figure \texttt{#1} not generated yet.\\
+      Run \texttt{python -m eval.plots} after training.}}%
+  }%
+}
+
+% Placeholder marker for numbers that only exist after training
+\newcommand{\todo}{\textcolor{gray}{--}}
+
+\title{Vision Mamba for Diabetic Retinopathy Grading:\\
+       a From-Scratch Implementation and Cross-Dataset Study}
+\author{Marc Pedrin\\IISc Spectrum Lab internship task}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+% -------------------------------------------------------------------------------------
+\begin{abstract}
+We implement Vision Mamba (Vim)~\cite{zhu2024vim}, a vision backbone built from
+bidirectional selective state space models, from scratch in plain PyTorch, and apply
+it to five-class diabetic retinopathy (DR) grading. Every component, including the
+selective scan, is written explicitly; no Mamba kernels, pretrained weights or
+ready-made data loaders are used. The model is trained on EyePACS and evaluated both
+on a held-out, patient-disjoint EyePACS test split and, without any adaptation, on
+the external Messidor-2 dataset. We use a scaled-down configuration (128-pixel
+inputs, 12 blocks) suited to a single GPU, and document every deviation from the
+paper. % TODO: fill in after training -- one sentence with the headline QWK on both
+% datasets, e.g. "The model reaches a quadratic weighted kappa of X on EyePACS and Y
+% on Messidor-2, a drop we attribute to domain shift."
+\end{abstract}
+
+% -------------------------------------------------------------------------------------
+\section{Introduction}
+
+Diabetic retinopathy is damage to the retina caused by diabetes, and a leading cause
+of preventable blindness in working-age adults. It progresses silently, so
+diabetic patients are screened regularly with fundus photographs, colour images of
+the back of the eye. Screening at population scale needs many trained graders,
+which motivates automated grading.
+
+\paragraph{Grading scale.} We use the five-level international clinical scale
+\cite{wilkinson2003scale}, as in the EyePACS and Messidor-2 labels:
+\begin{center}
+\begin{tabular}{cll}
+\toprule
+Grade & Name & Typical findings \\
+\midrule
+0 & No DR & no abnormalities \\
+1 & Mild non-proliferative & microaneurysms only \\
+2 & Moderate non-proliferative & more than microaneurysms, less than grade 3 \\
+3 & Severe non-proliferative & extensive haemorrhages, venous beading, IRMA \\
+4 & Proliferative & new vessel growth and/or vitreous haemorrhage \\
+\bottomrule
+\end{tabular}
+\end{center}
+The grades are \emph{ordinal}: confusing grade~0 with grade~4 is a much worse error
+than confusing grade~1 with grade~2. The lesions that separate the low grades are
+tiny (a microaneurysm spans a few pixels at our resolution), and the classes are
+heavily imbalanced, with about 73\% of EyePACS images at grade~0. Both facts shape
+our preprocessing, our loss and our choice of metric.
+
+\paragraph{Why Vision Mamba.} Vision Transformers~\cite{dosovitskiy2021vit} relate
+every image patch to every other through self-attention, at a cost quadratic in the
+number of patches. Vim replaces attention with selective state space models
+(Mamba~\cite{gu2023mamba}), whose cost is linear in the sequence length, and makes
+them bidirectional so that every patch can receive information from both sides.
+
+\paragraph{Contributions of this project.}
+(i) A line-by-line, from-scratch implementation of the Vim block (Algorithm~1 of the
+paper), tested against hand-computed cases; (ii) a leakage-free, patient-level
+EyePACS pipeline with fundus-specific preprocessing; (iii) from-scratch metrics,
+including quadratic weighted kappa, verified against scikit-learn; (iv) an in-domain
+and cross-domain evaluation.
+
+% -------------------------------------------------------------------------------------
+\section{The Vision Mamba architecture}
+
+\subsection{State space models}
+A state space model maps an input signal $x(t)$ to an output $y(t)$ through a hidden
+state $h(t)\in\mathbb{R}^N$:
+\[
+  h'(t) = \mathbf{A}h(t) + \mathbf{B}x(t), \qquad y(t) = \mathbf{C}h(t).
+\]
+This continuous form is theory only and is never coded. To process a sequence of
+tokens it is discretised with a step size $\Delta$, using the zero-order hold:
+\begin{equation}
+  \overline{\mathbf{A}} = \exp(\Delta\mathbf{A}), \qquad
+  \overline{\mathbf{B}} = (\Delta\mathbf{A})^{-1}\bigl(\exp(\Delta\mathbf{A})-\mathbf{I}\bigr)
+                          \cdot \Delta\mathbf{B},
+  \label{eq:zoh}
+\end{equation}
+which gives the recurrence
+\begin{equation}
+  h_t = \overline{\mathbf{A}}\,h_{t-1} + \overline{\mathbf{B}}\,x_t, \qquad
+  y_t = \mathbf{C}\,h_t .
+  \label{eq:recurrence}
+\end{equation}
+When $\overline{\mathbf{A}}$, $\overline{\mathbf{B}}$ and $\mathbf{C}$ are the same at
+every step (as in S4~\cite{gu2022s4}), the recurrence can be unrolled into a single
+global convolution with kernel
+\begin{equation}
+  \overline{\mathbf{K}} = \bigl(\mathbf{C}\overline{\mathbf{B}},\;
+     \mathbf{C}\overline{\mathbf{A}}\,\overline{\mathbf{B}},\; \dots,\;
+     \mathbf{C}\overline{\mathbf{A}}^{M-1}\overline{\mathbf{B}}\bigr),
+  \qquad y = x * \overline{\mathbf{K}} .
+  \label{eq:conv}
+\end{equation}
+Equation numbers (\ref{eq:zoh})--(\ref{eq:conv}) coincide with the paper's
+Eqs.~1--3.
+
+\paragraph{Selectivity.} Mamba makes $\mathbf{B}$, $\mathbf{C}$ and $\Delta$
+\emph{functions of the current token}, computed by small linear layers. Each token
+can then decide how much to write into the state, what to read out of it, and how
+much of the past to forget (a large $\Delta$ drives $\overline{\mathbf{A}}$ towards
+zero). Because these quantities change at every step, no fixed kernel
+$\overline{\mathbf{K}}$ exists and Eq.~(\ref{eq:conv}) no longer applies: the
+recurrence (\ref{eq:recurrence}) must be run, which we do with an explicit loop.
+$\mathbf{A}$ is diagonal and kept strictly negative, so
+$\overline{\mathbf{A}}=\exp(\Delta\mathbf{A})\in(0,1)$ and the state decays rather
+than explodes.
+
+\subsection{From images to token sequences}
+An image of size $H\times W$ is cut into $J$ patches of $P\times P$ pixels, each
+linearly projected to $D$ dimensions. A learnable class token $t_{\mathrm{cls}}$ is
+added and learnable position embeddings $\mathbf{E}_{\mathrm{pos}}$ are summed in:
+\begin{equation}
+  \mathbf{T}_0 = [\,t_{\mathrm{cls}};\; t_p^1\mathbf{W};\; t_p^2\mathbf{W};\;\dots;\;
+                 t_p^J\mathbf{W}\,] + \mathbf{E}_{\mathrm{pos}} .
+  \label{eq:tokens}
+\end{equation}
+($t_{\mathrm{cls}}$ is printed at the front, but the paper's default model places it
+in the middle of the sequence; see Section~\ref{sec:ablations}.) The sequence passes
+through $L$ Vim blocks with residual connections,
+$\mathbf{T}_l = \mathrm{Vim}(\mathbf{T}_{l-1}) + \mathbf{T}_{l-1}$, and the class
+token's final output is normalised and classified:
+$f = \mathrm{Norm}(\mathbf{T}_L^0)$, $\hat p = \mathrm{MLP}(f)$.
+
+\subsection{The bidirectional Vim block}
+Algorithm~\ref{alg:vim} reproduces the paper's Algorithm~1, with the same line
+numbering (comment lines included). Our \texttt{vim/vim\_block.py} and
+\texttt{vim/selective\_scan.py} follow it line by line, and each line of code is
+annotated with the algorithm line it implements.
+
+\begin{algorithm}[t]
+\caption{Vim block process (after Algorithm~1 of \citet{zhu2024vim}).}
+\label{alg:vim}
+\small
+\begin{algorithmic}[1]
+\Require token sequence $\mathbf{T}_{l-1}$ : $(\mathtt{B},\mathtt{M},\mathtt{D})$
+\Ensure token sequence $\mathbf{T}_{l}$ : $(\mathtt{B},\mathtt{M},\mathtt{D})$
+\State \textit{/* normalise the input sequence $\mathbf{T}'_{l-1}$ */}
+\State $\mathbf{T}'_{l-1} : (\mathtt{B},\mathtt{M},\mathtt{D}) \gets \mathbf{Norm}(\mathbf{T}_{l-1})$
+\State $\mathbf{x} : (\mathtt{B},\mathtt{M},\mathtt{E}) \gets \mathbf{Linear}^{\mathbf{x}}(\mathbf{T}'_{l-1})$
+\State $\mathbf{z} : (\mathtt{B},\mathtt{M},\mathtt{E}) \gets \mathbf{Linear}^{\mathbf{z}}(\mathbf{T}'_{l-1})$
+\State \textit{/* process with different direction */}
+\For{$o$ in \{forward, backward\}}
+  \State $\mathbf{x}'_o : (\mathtt{B},\mathtt{M},\mathtt{E}) \gets \mathbf{SiLU}(\mathbf{Conv1d}_o(\mathbf{x}))$
+  \State $\mathbf{B}_o : (\mathtt{B},\mathtt{M},\mathtt{N}) \gets \mathbf{Linear}^{\mathbf{B}}_o(\mathbf{x}'_o)$
+  \State $\mathbf{C}_o : (\mathtt{B},\mathtt{M},\mathtt{N}) \gets \mathbf{Linear}^{\mathbf{C}}_o(\mathbf{x}'_o)$
+  \State \textit{/* softplus ensures positive $\Delta_o$ */}
+  \State $\Delta_o : (\mathtt{B},\mathtt{M},\mathtt{E}) \gets \log\bigl(1+\exp(\mathbf{Linear}^{\Delta}_o(\mathbf{x}'_o) + \mathbf{Parameter}^{\Delta}_o)\bigr)$
+  \State \textit{/* shape of $\mathbf{Parameter}^{\mathbf{A}}_o$ is $(\mathtt{E},\mathtt{N})$ */}
+  \State $\overline{\mathbf{A}}_o : (\mathtt{B},\mathtt{M},\mathtt{E},\mathtt{N}) \gets \Delta_o \otimes \mathbf{Parameter}^{\mathbf{A}}_o$
+  \State $\overline{\mathbf{B}}_o : (\mathtt{B},\mathtt{M},\mathtt{E},\mathtt{N}) \gets \Delta_o \otimes \mathbf{B}_o$
+  \State \textit{/* initialise $\mathbf{h}_o$ and $\mathbf{y}_o$ with 0 */}
+  \State $\mathbf{h}_o : (\mathtt{B},\mathtt{E},\mathtt{N}) \gets \mathrm{zeros}(\mathtt{B},\mathtt{E},\mathtt{N})$
+  \State $\mathbf{y}_o : (\mathtt{B},\mathtt{M},\mathtt{E}) \gets \mathrm{zeros}(\mathtt{B},\mathtt{M},\mathtt{E})$
+  \State \textit{/* SSM recurrent */}
+  \For{$i$ in $\{0, \dots, M-1\}$}
+    \State $\mathbf{h}_o = \overline{\mathbf{A}}_o[:,i,:,:] \odot \mathbf{h}_o + \overline{\mathbf{B}}_o[:,i,:,:] \odot \mathbf{x}'_o[:,i,:,\mathrm{None}]$
+    \State $\mathbf{y}_o[:,i,:] = \mathbf{h}_o \otimes \mathbf{C}_o[:,i,:]$
+  \EndFor
+\EndFor
+\State \textit{/* get gated $\mathbf{y}_o$ */}
+\State $\mathbf{y}'_{\mathrm{forward}} : (\mathtt{B},\mathtt{M},\mathtt{E}) \gets \mathbf{y}_{\mathrm{forward}} \odot \mathbf{SiLU}(\mathbf{z})$
+\State $\mathbf{y}'_{\mathrm{backward}} : (\mathtt{B},\mathtt{M},\mathtt{E}) \gets \mathbf{y}_{\mathrm{backward}} \odot \mathbf{SiLU}(\mathbf{z})$
+\State \textit{/* residual connection */}
+\State $\mathbf{T}_l : (\mathtt{B},\mathtt{M},\mathtt{D}) \gets \mathbf{Linear}^{\mathbf{T}}(\mathbf{y}'_{\mathrm{forward}} + \mathbf{y}'_{\mathrm{backward}}) + \mathbf{T}_{l-1}$
+\end{algorithmic}
+\end{algorithm}
+
+Line~13 is printed without the exponential of Eq.~(\ref{eq:zoh}); we apply it, as the
+official code does, since otherwise $\overline{\mathbf{A}}$ would be negative.
+Line~14 is the simplified discretisation $\overline{\mathbf{B}}=\Delta\mathbf{B}$,
+a first-order approximation of Eq.~(\ref{eq:zoh}) that is also used by the official
+Mamba code. The backward direction is implemented by flipping the sequence, running
+the same code with the backward weights, and flipping the result back.
+
+\subsection{Design choices validated by the paper's ablations}
+\label{sec:ablations}
+\paragraph{Bidirectionality (paper Table~4).} A single forward scan only carries
+information left to right, so a token never hears from the patches after it.
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+Bidirectional strategy & ImageNet top-1 (\%) & ADE20K mIoU \\
+\midrule
+None (forward only)                     & 73.2 & 32.3 \\
+Bidirectional layer                     & 70.9 & 33.6 \\
+Bidirectional SSM                       & 72.8 & 33.2 \\
+Bidirectional SSM + Conv1d (default)    & \textbf{73.9} & \textbf{35.9} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Class token position (paper Table~5).} Because the scans are directional
+and their memory decays with distance, a class token in the middle of the sequence
+is reached by both directions with the shortest average distance to every patch.
+\begin{center}
+\begin{tabular}{lc}
+\toprule
+Classification design & ImageNet top-1 (\%) \\
+\midrule
+Mean pool               & 73.9 \\
+Max pool                & 73.4 \\
+Head class token        & 75.2 \\
+Double class token      & 74.3 \\
+Middle class token (default) & \textbf{76.1} \\
+\bottomrule
+\end{tabular}
+\end{center}
+We use the default variant in both cases: bidirectional SSM with Conv1d, and a
+middle class token at index 32 of the 65-token sequence.
+
+% -------------------------------------------------------------------------------------
+\section{Implementation details and deviations from the paper}
+
+Everything is written from scratch in PyTorch: patch embedding, tokens and position
+embeddings, the selective scan (an explicit Python loop over the sequence), the
+bidirectional block, the model, the datasets, the split and the metrics. PyTorch
+supplies only generic building blocks (\texttt{nn.Linear}, \texttt{nn.Conv1d},
+\texttt{nn.LayerNorm}, autograd, AdamW) and torchvision only image transforms.
+The paper's hardware-aware parallel scan (its Section~3.5) is deliberately out of
+scope.
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Setting & Paper (Vim-Ti) & Ours \\
+\midrule
+Input size            & $224\times224$ & $128\times128$ \\
+Patch size / patches  & 16 / 196 & 16 / 64 \\
+Sequence length $M$   & 197 & 65 \\
+Embedding dim $D$     & 192 & 192 \\
+Expanded dim $E$      & 384 & 384 \\
+State dim $N$         & 16 & 16 \\
+Depth $L$             & 24 & 12 \\
+Conv1d kernel         & 4 & 4 \\
+Class token           & middle & middle (index 32) \\
+$\Delta$ projection   & low-rank (code) & full $E\times E$ (as printed) \\
+Norm                  & RMSNorm (code) & LayerNorm \\
+$D\cdot x$ skip term  & yes (code) & no (not in Algorithm~1) \\
+Parameters            & $\approx$7M & 6,857,093 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Parameter count.} Halving the depth does not halve the parameter count,
+because the printed Algorithm~1 projects $\Delta$ with a full $E\times E$ matrix
+(147,456 weights per direction per block), where the official code uses a rank-12
+factorisation. Our block has 557,952 parameters, roughly twice an official block,
+and the two $\Delta$ projections account for 53\% of it.
+
+\paragraph{Initialisation.} $\mathbf{A}=-\exp(\mathbf{A}_{\log})$ with
+$\mathbf{A}_{\log}$ initialised to $\log(1,\dots,16)$ (S4D-real~\cite{gu2022s4d}),
+giving a spread of decay rates; the $\Delta$ bias is set so that the initial step
+sizes are log-uniform in $[0.001, 0.1]$, as in Mamba; the class token and position
+embeddings use a truncated normal with standard deviation 0.02.
+We observed that, with these small initial step sizes and no $D\cdot x$ term, a
+freshly initialised block adds very little to its input (standard deviation about
+$4\times10^{-4}$ for a unit-variance input), so the initial 12-block stack is close
+to the identity. This is stable, and AdamW's per-parameter step normalisation lets
+training grow the branches.
+
+\paragraph{Efficiency of the reference loop.} Indexing the precomputed
+$\overline{\mathbf{A}}$ inside the loop makes the backward pass allocate a full-size
+gradient at every step. Splitting the tensors once with \texttt{torch.unbind}
+leaves the mathematics unchanged and made the backward pass about $11\times$ faster
+on CPU.
+
+\paragraph{Verification.} 63 unit and integration tests cover, among others: a
+two-step selective scan computed by hand; the limits of instant forgetting and of
+no forgetting (a running sum); separate parameters per direction and a control
+experiment showing the block is direction-aware; gradient flow through 12 blocks;
+patient-disjoint splits; and every metric against scikit-learn.
+
+% -------------------------------------------------------------------------------------
+\section{Datasets and preprocessing}
+
+\paragraph{EyePACS} (Kaggle Diabetic Retinopathy Detection, 2015~\cite{eyepacs2015}):
+35,126 labelled images from 17,563 patients (left and right eye each), from many
+camera models. We split it at the \emph{patient} level into 80\% train, 10\%
+validation and 10\% test, stratified by each patient's worse-eye grade, with a fixed
+seed. Keeping both eyes of a patient in the same split prevents data leakage: the
+two eyes are highly correlated, and a model could otherwise score well partly by
+recognising the patient.
+
+\paragraph{Messidor-2}~\cite{decenciere2014messidor,abramoff2013messidor2}:
+1,748 images from 874 examinations, acquired in French hospitals with a different
+camera, with the adjudicated grades of \citet{krause2018grader}. Ungradable images
+are excluded. Messidor-2 is used \emph{only} for evaluation; it never influences
+training, checkpoint selection or any hyperparameter.
+
+\paragraph{Preprocessing.} (1) Crop the black border to the bounding box of the
+retina (pixels brighter than 10/255); (2) pad to a square with black so the round
+retina is not distorted; (3) resize to $128\times128$; (4) normalise with the
+ImageNet channel statistics. Training images are additionally flipped horizontally
+and vertically, rotated by up to $\pm15^\circ$, and jittered by up to 10\% in
+brightness, contrast and saturation (no hue change, since lesion colour is
+diagnostic). We deliberately avoid the paper's random crops, random erasing and
+mixup: they can remove or blend away the few tiny lesions that define the lower
+grades, silently making the label wrong.
+
+% -------------------------------------------------------------------------------------
+\section{Training methodology}
+
+\begin{center}
+\begin{tabular}{p{3.6cm}p{4.2cm}p{6.4cm}}
+\toprule
+Hyperparameter & Paper (ImageNet) & Ours (EyePACS) \\
+\midrule
+Optimiser          & AdamW ($\beta_1=0.9$) & AdamW ($\beta=(0.9, 0.999)$) \\
+Learning rate      & $1\times10^{-3}$ & $1\times10^{-3}$ \\
+Weight decay       & 0.05 & 0.05 (not on norms, biases, $\mathbf{E}_{\mathrm{pos}}$, $t_{\mathrm{cls}}$, $\mathbf{A}_{\log}$) \\
+Schedule           & cosine & 3 warmup epochs, cosine to $10^{-5}$ \\
+Epochs             & 300 & 30 \\
+Batch size         & 1024 & 32 \\
+Loss               & CE + label smoothing & CE with inverse-frequency class weights \\
+Augmentation       & crop, flip, mixup, erasing & flips, rotation $\pm15^\circ$, mild jitter \\
+EMA                & yes & no \\
+Gradient clipping  & -- & max norm 1.0 \\
+Precision          & -- & mixed (float16 autocast) \\
+Checkpoint selection & -- & best validation QWK \\
+Seed               & -- & 42 (all generators, deterministic cuDNN) \\
+Hardware           & 8 A800 GPUs & 1 Kaggle T4 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The short schedule and small batch reflect a limited GPU budget; the goal of the
+project is a faithful, understandable implementation rather than a state-of-the-art
+score. Class weights $w_c = N/(K\,n_c)$ counter the imbalance, so that each grade
+contributes about equally to the loss.
+
+\paragraph{Metrics.} We report accuracy, macro-averaged precision, recall and F1, and
+quadratic weighted kappa (QWK)~\cite{cohen1968weighted}, the official EyePACS
+metric:
+\[
+  \kappa = 1 - \frac{\sum_{i,j} W_{ij} O_{ij}}{\sum_{i,j} W_{ij} E_{ij}},\qquad
+  W_{ij} = \frac{(i-j)^2}{(K-1)^2},
+\]
+where $O$ is the confusion matrix and $E$ the matrix expected by chance from the
+marginal grade frequencies. The quadratic weights punish a prediction four grades
+away sixteen times as hard as a prediction one grade away, matching the ordinal
+nature of DR grades. Accuracy alone is misleading here: always predicting grade~0
+already scores about 73\%, but has $\kappa=0$.
+
+% -------------------------------------------------------------------------------------
+\section{Results}
+
+% TODO: fill in after training -- copy the numbers printed by
+% `python -m eval.evaluate` (also stored in outputs/default/results.json).
+\begin{table}[h]
+\centering
+\caption{Results on the held-out EyePACS test split (in-domain) and on Messidor-2
+(external, never seen in training).}
+\label{tab:results}
+\begin{tabular}{lcc}
+\toprule
+Metric & EyePACS test & Messidor-2 \\
+\midrule
+Images           & \todo & \todo \\
+Accuracy         & \todo & \todo \\
+QWK              & \todo & \todo \\
+Macro precision  & \todo & \todo \\
+Macro recall     & \todo & \todo \\
+Macro F1         & \todo & \todo \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% TODO: fill in after training -- per-grade recall from the evaluate.py table
+\begin{table}[h]
+\centering
+\caption{Per-grade recall (share of each true grade that was predicted correctly).}
+\label{tab:recall}
+\begin{tabular}{lcc}
+\toprule
+Grade & EyePACS test & Messidor-2 \\
+\midrule
+0 none      & \todo & \todo \\
+1 mild      & \todo & \todo \\
+2 moderate  & \todo & \todo \\
+3 severe    & \todo & \todo \\
+4 proliferative & \todo & \todo \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[h]
+\centering
+\maybefigure{training_curves.png}{\textwidth}
+\caption{Convergence: training and validation loss and accuracy, and validation QWK
+per epoch; the marked point is the checkpoint used for evaluation.}
+\label{fig:curves}
+\end{figure}
+% TODO: fill in after training -- two or three sentences describing Fig. 1:
+% does the loss still fall at epoch 30, is there a train/validation gap
+% (over-fitting), and at which epoch did validation QWK peak?
+
+\begin{figure}[h]
+\centering
+\maybefigure{confusion_eyepacs_test.png}{0.48\textwidth}\hfill
+\maybefigure{confusion_messidor2.png}{0.48\textwidth}
+\caption{Row-normalised confusion matrices on the EyePACS test split (left) and
+Messidor-2 (right). Cell colour is the share of the true grade; the count is in
+brackets.}
+\label{fig:confusion}
+\end{figure}
+% TODO: fill in after training -- which grades are confused most? Are errors mostly
+% to neighbouring grades (good for QWK) or far away? Is grade 1 recognised at all?
+
+\begin{figure}[h]
+\centering
+\maybefigure{examples_eyepacs_test.png}{\textwidth}\\[1ex]
+\maybefigure{examples_messidor2.png}{\textwidth}
+\caption{Example predictions on EyePACS (top) and Messidor-2 (bottom): true and
+predicted grade, half chosen among errors.}
+\label{fig:examples}
+\end{figure}
+
+% -------------------------------------------------------------------------------------
+\section{Analysis of cross-dataset generalisation}
+
+A drop in performance from the EyePACS test split to Messidor-2 is expected, even
+though the task is the same, because of \emph{domain shift}: Messidor-2 was acquired
+with a different camera (colour balance, sharpness, field of view and border
+shape differ), in a different population (French hospital patients rather than a
+mostly US screening network), under different acquisition protocols, and graded to
+a different, adjudicated reference standard. Whatever the model learnt that is
+specific to EyePACS photographs rather than to the lesions themselves does not
+transfer. Our preprocessing (cropping to the retina, padding, normalisation, colour
+jitter) is designed to reduce the most obvious of these differences, but cannot
+remove them.
+
+% TODO: fill in after training -- quantify the drop (QWK and per-grade recall from
+% Tables 1-2), say which grades suffer most, and relate it to the confusion matrices
+% (e.g. does the model under-call grades on the external set?). Compare with the
+% grade distributions of the two datasets.
+
+% -------------------------------------------------------------------------------------
+\section{Limitations}
+
+\begin{itemize}
+  \item \textbf{Scale.} 128-pixel inputs discard detail: microaneurysms become a
+        pixel or two, which particularly hurts grade~1. Twelve blocks and 30 epochs
+        are far below the paper's 24 blocks and 300 epochs.
+  \item \textbf{Speed.} The selective scan is a sequential Python loop, much slower
+        than the paper's fused parallel kernel; this limited the training budget.
+  \item \textbf{No pretraining.} The model is trained from random initialisation on
+        about 28,000 images, whereas Vim-Ti is trained on 1.28 million ImageNet
+        images.
+  \item \textbf{Label noise.} EyePACS grades come from single graders and are known
+        to be noisy, which caps the achievable agreement.
+  \item \textbf{Single run.} Results are from one seed; we did not measure the
+        variance across seeds.
+        % TODO: fill in after training -- remove or adjust if several seeds are run
+  \item \textbf{Faithfulness choices.} Following the printed Algorithm~1 (full
+        $\Delta$ projection, no $D\cdot x$ term) makes our blocks larger than the
+        official ones and our model a slightly different function from the official
+        Vim-Ti.
+\end{itemize}
+
+% -------------------------------------------------------------------------------------
+\section{Conclusion}
+
+We implemented Vision Mamba from first principles, keeping a direct, documented
+correspondence between the paper's equations and Algorithm~1 and the code, and
+applied it to diabetic retinopathy grading with a leakage-free evaluation on an
+in-domain test split and an external dataset.
+% TODO: fill in after training -- summarise the headline QWK on both datasets and
+% the size of the domain-shift drop, in one or two sentences.
+The main lessons are that the selective, bidirectional scan can be implemented
+transparently in a few dozen lines, that faithful choices such as the printed full
+$\Delta$ projection have measurable consequences for model size, and that
+cross-dataset evaluation is essential for judging a medical imaging model.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}

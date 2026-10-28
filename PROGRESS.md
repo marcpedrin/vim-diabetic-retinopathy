@@ -230,3 +230,27 @@ Built:
 Tests (`tests/test_evaluate_and_plots.py`) prove, end to end on synthetic data:
 train (2 epochs) -> evaluate (both datasets, every metric present, the ungradable
 Messidor-2 image skipped, JSON and CSVs written) -> plot (all five figures written).
+
+## Phase 9: report and reading guide
+
+Built:
+- `report/main.tex`: abstract; introduction and DR grading background; the Vim
+  architecture with Eqs. 1-4 typeset (numbered as in the paper), Algorithm 1 as an
+  `algorithm` environment with the paper's line numbering, the Table 4 and Table 5
+  ablations with their numbers; implementation details and deviations (with the
+  parameter-count and near-identity-initialisation findings); datasets and
+  preprocessing; training methodology table; results tables; convergence, confusion
+  and example figures via `\includegraphics` (labelled placeholder boxes until
+  `eval.plots` has been run); cross-dataset analysis; limitations; conclusion.
+  Every number that needs the real run is marked `% TODO: fill in after training`.
+- `report/references.bib`: Vim, Mamba, S4, S4D, ViT, EyePACS (Kaggle), Messidor
+  (Decenciere 2014), Messidor-2 (Abramoff 2013), Krause 2018 adjudicated grades,
+  Cohen 1968 weighted kappa, the international DR severity scale.
+- `README.md` rewritten: overview, paper link, layout, install, tests, smoke test,
+  data, training (incl. Kaggle), evaluation, figures, report build, config table vs
+  the paper, from-scratch vs PyTorch, reproducibility.
+- `READING_ORDER_DELETE_BEFORE_PUSH.md` (git-ignored): personal study guide.
+
+Verification: the LaTeX was checked by hand (balanced environments, every citation
+key defined, ASCII only) but NOT compiled in this environment, because no TeX
+installation was available. Compile it with `latexmk -pdf main.tex` or on Overleaf.
