@@ -115,3 +115,27 @@ input; ~0.0015 summed over 12 blocks), so a fresh stack is close to the identity
 This comes from the small initial Delta and the absence of the D*x term. It is
 harmless with AdamW, whose per-parameter step size does not depend on the raw
 gradient scale.
+
+## Phase 5: the full model
+
+Built:
+- `vim/vision_mamba.py`: `VisionMamba` = PatchEmbed -> ClassTokenPosEmbed -> 12 x
+  VimBlock -> LayerNorm -> class token at index 32 -> Linear 192 -> 5. The five
+  steps are commented against Section 3.2 (Eq. 4, T_l = Vim(T_{l-1}) + T_{l-1},
+  f = Norm(T_L^0), p_hat = MLP(f)). Also `build_model(cfg.model)` and
+  `count_parameters()`; `python -m vim.vision_mamba` prints a parameter breakdown.
+- `vim/__init__.py` exports every public piece.
+
+Parameter count: 6,857,093, versus the paper's ~7M for Vim-Ti. It is NOT half the
+paper's size despite half the depth, because the printed Algorithm 1 line 11 uses a
+full E->E Delta projection (147,456 weights per direction per block) where the
+official code uses a rank-12 factorisation. Our block: 557,952 parameters; an
+official block: ~282,000. The two Delta projections are 53% of each block.
+
+Tests (`tests/test_vision_mamba.py`) prove:
+- (2, 3, 128, 128) -> (2, 5);
+- the parameter count is exactly 6,857,093 (printed);
+- one AdamW step on a fixed batch lowers that batch's loss (1.81 -> 1.52);
+- eval mode under torch.no_grad() works, records no gradient history, and is
+  deterministic;
+- `build_model` from the YAML config gives the same architecture as the defaults.
