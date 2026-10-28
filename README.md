@@ -22,7 +22,7 @@ no `timm`, no pretrained weights.
 - [x] Phase 1: repo scaffolding (config, seeding, logging, checkpoints)
 - [x] Phase 2: class token and position embeddings
 - [x] Phase 3: selective scan
-- [ ] Phase 4: bidirectional Vim block
+- [x] Phase 4: bidirectional Vim block
 - [ ] Phase 5: full model
 - [ ] Phase 6: data pipeline
 - [ ] Phase 7: training

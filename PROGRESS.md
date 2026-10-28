@@ -81,3 +81,37 @@ Tests (`tests/test_selective_scan.py`) prove:
 - with A near zero (A_bar = 1) the state is a running sum (matches torch.cumsum);
 - a 2-token, 2-slot example worked out by hand gives y = [0.5, e^-1];
 - backward() gives finite, non-zero gradients to x, delta, A, B and C.
+
+## Phase 4: the bidirectional Vim block
+
+Built:
+- `vim/vim_block.py`: `DirectionalSSM` (Algorithm 1 lines 7-22 for one direction:
+  depthwise causal Conv1d(k=4) + SiLU, Linear E->N for B and C, Linear E->E plus a
+  Parameter bias + softplus for Delta, A = -exp(A_log) with the S4D-real
+  initialisation, then `selective_scan`) and `VimBlock` (the whole of Algorithm 1:
+  LayerNorm, one Linear D->2E split explicitly into x and z, a
+  `for direction in ("forward", "backward")` loop with separate weights per
+  direction, flip-scan-flip for the backward direction, SiLU(z) gating, sum,
+  Linear E->D, residual). The module docstring transcribes Algorithm 1 line by line
+  and maps each line to the code.
+- Deviations documented: full E->E Delta projection as printed (official code is
+  low-rank), LayerNorm (official Vim-Ti uses RMSNorm), no D*x skip term and no
+  divide-by-2 (both in the official code, neither in the printed algorithm).
+
+Tests (`tests/test_vim_block.py`) prove:
+- shape (2, 65, 192) -> (2, 65, 192);
+- the two directions own separate tensors (different memory, different values);
+- the block is direction-aware: block(reverse(x)) != reverse(block(x)), and a
+  control experiment shows that copying the forward weights into the backward
+  branch makes the two equal, so the difference comes from the separate weights;
+- a 12-block stack stays finite with output std ~1.0, both at initialisation and
+  with every Delta pushed to ~1 ("awake" branches);
+- every parameter of a 12-block stack gets a finite, non-zero gradient;
+- A < 0 everywhere, equal to -1..-16 at initialisation, and the initial Delta
+  lies in [0.001, 0.1].
+
+Finding: at initialisation each block adds very little (std ~4e-4 for a unit-std
+input; ~0.0015 summed over 12 blocks), so a fresh stack is close to the identity.
+This comes from the small initial Delta and the absence of the D*x term. It is
+harmless with AdamW, whose per-parameter step size does not depend on the raw
+gradient scale.
