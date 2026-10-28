@@ -1,4 +1,16 @@
-torch
-torchvision
-numpy
-pytest
+# Runtime dependencies (the only third-party libraries the project is allowed).
+# Versions are lower bounds that are known to work; tested with torch 2.15 (CPU).
+torch>=2.1
+torchvision>=0.16
+numpy>=1.24
+pandas>=2.0
+pillow>=10.0
+matplotlib>=3.7
+tqdm>=4.65
+pyyaml>=6.0
+
+# Test-only dependencies. scikit-learn is used ONLY in tests/test_metrics.py, to
+# cross-check the from-scratch metrics in eval/metrics.py. Library and training
+# code never import it.
+pytest>=7.0
+scikit-learn>=1.3

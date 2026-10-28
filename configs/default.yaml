@@ -1,0 +1,198 @@
+# =====================================================================================
+# default.yaml - every hyperparameter of the project, in one place.
+#
+# Why a YAML file instead of numbers typed into the Python code?
+#   - One place to look: a reader (or examiner) can see the whole experiment at once.
+#   - Reproducibility: the exact file used for a run is copied into the run's output
+#     folder, so any result can be traced back to the settings that produced it.
+#   - No hidden "magic numbers": the Python code reads every value from here
+#     (through vim/config.py), so changing an experiment never means editing code.
+#
+# Each value is followed by a comment of the form
+#   "paper: <value used in Vim paper>  |  ours: <why we differ, if we do>"
+# The paper is "Vision Mamba" (Zhu et al., ICML 2024, arXiv 2401.09417), and the
+# model size we copy is its smallest variant, Vim-Ti (Tiny).
+#
+# YAML syntax in 3 lines: `key: value` pairs; indentation (2 spaces) means "belongs
+# to the section above"; `#` starts a comment. Numbers like 1.0e-3 are read as floats.
+# =====================================================================================
+
+# Master random seed. Every random choice in the project (weight initialisation,
+# data split, shuffling, augmentation) is derived from this one number, so two runs
+# with the same seed on the same hardware produce the same result.
+seed: 42
+
+# -------------------------------------------------------------------------------------
+# model: the shape of the Vision Mamba network (paper Section 3.2 and Section 4.1)
+# -------------------------------------------------------------------------------------
+model:
+  # Side length of the square input image, in pixels.
+  # paper: 224  |  ours: 128, to cut compute on a single Kaggle GPU. Approved by the
+  # supervisor. Fewer pixels -> fewer patches -> a shorter sequence to scan.
+  img_size: 128
+
+  # Side length of one square patch, in pixels.
+  # paper: 16  |  ours: 16 (same). 128 / 16 = 8 patches per side -> 8 x 8 = 64 patches.
+  patch_size: 16
+
+  # Number of colour channels in the input image (red, green, blue).
+  # paper: 3  |  ours: 3 (same). Fundus photographs are ordinary RGB images.
+  in_chans: 3
+
+  # D: the length of the vector that represents each token (the "embedding").
+  # paper (Vim-Ti): 192  |  ours: 192 (same).
+  embed_dim: 192
+
+  # Expansion factor: inside each Vim block the D=192 numbers are widened to
+  # E = expand * D = 2 * 192 = 384 before the state space model runs.
+  # paper: E = 384 for Vim-Ti, i.e. expand 2  |  ours: 2 (same).
+  expand: 2
+
+  # N: the number of "slots" in the hidden state h of the state space model,
+  # per channel. Think of N small buckets per channel, each leaking at its own rate.
+  # paper: 16  |  ours: 16 (same).
+  d_state: 16
+
+  # L: how many Vim blocks are stacked on top of each other.
+  # paper (Vim-Ti): 24  |  ours: 12. Halving the depth halves the training time, and
+  # the Python-loop selective scan (see vim/selective_scan.py) is slow. Approved.
+  depth: 12
+
+  # Number of output classes: diabetic retinopathy grades 0, 1, 2, 3, 4.
+  # paper: 1000 (ImageNet classes)  |  ours: 5, because this is a different task.
+  num_classes: 5
+
+  # Where the class token is inserted into the sequence of 64 patch tokens.
+  #   "middle" -> index 64 // 2 = 32   (paper's default and best: 76.1% top-1)
+  #   "head"   -> index 0              (ViT-style:            75.2% top-1)
+  # paper: middle (Table 5)  |  ours: middle (same). See vim/tokens.py for why.
+  cls_position: middle
+
+  # Kernel size of the small depthwise 1D convolution inside each Vim block
+  # (Algorithm 1, line 7). Each token looks at itself and the 3 tokens before it.
+  # paper: 4 (inherited from Mamba)  |  ours: 4 (same).
+  conv_kernel: 4
+
+  # Range used to initialise the step size Delta (Algorithm 1, line 11). At the start
+  # of training each channel's Delta is drawn between dt_min and dt_max (on a log
+  # scale), so some channels start with short memories and some with long ones.
+  # paper: not stated; the Mamba code uses 0.001 and 0.1  |  ours: same as Mamba.
+  dt_min: 0.001
+  dt_max: 0.1
+
+# -------------------------------------------------------------------------------------
+# data: where the images live and how they are prepared (see data/ package)
+# -------------------------------------------------------------------------------------
+data:
+  # EyePACS (Kaggle "Diabetic Retinopathy Detection", 2015): our TRAINING dataset.
+  # Folder holding the images, and the CSV with columns `image,level`.
+  # paper: trains on ImageNet  |  ours: EyePACS, because the task is DR grading.
+  # These paths are relative to the repo root; on Kaggle, override them with
+  # e.g.  --override data.eyepacs_image_dir=/kaggle/input/<dataset>/train
+  eyepacs_image_dir: datasets/eyepacs/train
+  eyepacs_labels_csv: datasets/eyepacs/trainLabels.csv
+  # File extension added to the names in the CSV ("10_left" -> "10_left.jpeg").
+  eyepacs_image_ext: .jpeg
+
+  # Messidor-2: EVALUATION ONLY, never trained on (an explicit task rule).
+  # The common Kaggle release ships a CSV with the columns named below; if your copy
+  # uses different column names, change these two settings rather than the code.
+  messidor_image_dir: datasets/messidor2/images
+  messidor_labels_csv: datasets/messidor2/messidor_data.csv
+  messidor_id_column: image_id
+  messidor_label_column: adjudicated_dr_grade
+  # Used only if an id in the CSV has no extension of its own.
+  messidor_image_ext: .png
+
+  # Fractions of EyePACS PATIENTS (not images) held out for validation and testing.
+  # The remaining 80% are used for training. Not in the paper (ImageNet has a
+  # fixed official split); EyePACS's public labels come as one table, so we split it.
+  val_fraction: 0.1
+  test_fraction: 0.1
+
+  # A pixel is "black border" if its brightness (0-255) is at or below this value.
+  # Used by data/transforms.py to crop the empty black frame around the retina.
+  crop_threshold: 10
+
+  # Train-only augmentation strengths (data/transforms.py).
+  # paper: random crop, horizontal flip, mixup, random erasing, label smoothing  |
+  # ours: flips + small rotation + mild colour jitter only. Heavy crops and erasing
+  # can delete the tiny lesions that separate DR grade 1 from grade 2.
+  rotation_degrees: 15
+  color_jitter: 0.1
+
+  # DataLoader settings (explained in data/__init__.py).
+  # num_workers: background processes that load images while the GPU computes.
+  # Kaggle notebooks have 2-4 CPU cores, so 2 is a safe value. 0 = load in the
+  # main process (slowest, but simplest to debug, and what the tests use).
+  num_workers: 2
+  # pin_memory: put batches in page-locked RAM so copying them to the GPU is faster.
+  pin_memory: true
+
+# -------------------------------------------------------------------------------------
+# train: the optimisation recipe (paper Section 4.1)
+# -------------------------------------------------------------------------------------
+train:
+  # Number of full passes over the training set.
+  # paper: 300  |  ours: 30. We have limited Kaggle GPU hours, and the supervisor said
+  # the final accuracy does not matter; 30 epochs is enough to show learning curves.
+  epochs: 30
+
+  # Images per optimisation step.
+  # paper: 1024 (spread over 8 GPUs)  |  ours: 32, which fits on one 16 GB T4/P100
+  # with the memory-hungry Python-loop scan.
+  batch_size: 32
+
+  # AdamW learning rate (how big a step the optimiser takes).
+  # paper: 1e-3  |  ours: 1e-3 (same value). Note: with a 32x smaller batch, the
+  # "linear scaling rule" would suggest a smaller rate; warmup and gradient clipping
+  # below keep 1e-3 stable. Lower it to 5e-4 if the loss is noisy.
+  lr: 1.0e-3
+
+  # AdamW weight decay (gently pulls every weight towards zero each step).
+  # paper: 0.05  |  ours: 0.05 (same).
+  weight_decay: 0.05
+
+  # Epochs over which the learning rate rises linearly from ~0 up to `lr`, before the
+  # cosine decay begins. paper: not stated in the text (the DeiT recipe the official
+  # code builds on uses 5 of 300)  |  ours: 3 of 30, i.e. the first 10% of training,
+  # a common choice for short runs where the random starting weights are fragile.
+  warmup_epochs: 3
+
+  # The cosine schedule decays the learning rate from `lr` down to this floor.
+  # paper: cosine schedule, floor not stated  |  ours: 1e-5.
+  min_lr: 1.0e-5
+
+  # Gradient clipping: if the total gradient length exceeds this, it is shrunk to it.
+  # Protects against a single bad batch kicking the weights far away.
+  # paper: not stated  |  ours: 1.0, a common safe default.
+  grad_clip: 1.0
+
+  # Automatic mixed precision (float16 where safe). A SPEED/memory optimisation only;
+  # it does not change what the model computes in any meaningful way. Ignored on CPU.
+  # paper: not stated  |  ours: on.
+  amp: true
+
+  # Weight the loss by inverse class frequency, because EyePACS is ~73% grade 0.
+  # paper: not applicable (ImageNet is balanced)  |  ours: on. See train/train.py.
+  class_weights: true
+
+  # Where checkpoints, the CSV log and a copy of this config are written.
+  output_dir: outputs/default
+
+  # Settings used ONLY when train/train.py is run with --smoke-test: a quick
+  # end-to-end check of the whole pipeline on a laptop before using Kaggle hours.
+  smoke_test_images: 100
+  smoke_test_epochs: 2
+  smoke_test_batch_size: 8
+
+# -------------------------------------------------------------------------------------
+# eval: evaluation and figures (eval/ package)
+# -------------------------------------------------------------------------------------
+eval:
+  # Checkpoint to evaluate; train/train.py saves the best one (by validation QWK) here.
+  checkpoint: outputs/default/best.pt
+  # Metrics for EyePACS-test and Messidor-2 are written to this JSON file.
+  results_json: outputs/default/results.json
+  # Report figures are saved here and picked up by report/main.tex.
+  figures_dir: report/figures
