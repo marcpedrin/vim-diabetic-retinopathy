@@ -37,3 +37,24 @@ number. Eq. 1 is the zero-order-hold discretisation, Eq. 2 the discrete
 recurrence, Eq. 3 the global convolution, Eq. 4 the token sequence T_0. In
 Algorithm 1, line 17 initialises y, the inner loop is line 19, the state update
 is line 20 and the read-out is line 21. All files use this numbering.
+
+## Phase 2: tokens and position embeddings
+
+Built:
+- `vim/tokens.py`: `ClassTokenPosEmbed`, the rest of Eq. 4 (Section 3.2). A learnable
+  class token `t_cls` (1, 1, 192) is inserted at the middle index 32 of the 64 patch
+  tokens, then learnable position embeddings `E_pos` (1, 65, 192) are added:
+  (B, 64, 192) -> (B, 65, 192). Both are initialised with a truncated normal,
+  std 0.02, cut off at +-2 std (PyTorch's default cut-off of +-2 is absolute and
+  would truncate nothing at this std, so it is passed explicitly).
+- Comments cover why a class token exists, why the middle beats the front
+  (Table 5: 76.1% vs 75.2%), why position embeddings are needed for a sequential
+  scan, nn.Module / nn.Parameter / super().__init__() / forward(), and broadcasting.
+
+Tests (`tests/test_tokens.py`) prove:
+- the shape (2, 64, 192) -> (2, 65, 192);
+- the class token lands exactly at index 32, with patches 0..31 before it and
+  patches 32..63 shifted to indices 33..64 in their original order;
+- the "head" variant puts it at index 0;
+- both tables are registered learnable parameters with the Eq. 4 shapes, and the
+  initial values are small, non-zero and within the truncation bound.
