@@ -139,3 +139,32 @@ Tests (`tests/test_vision_mamba.py`) prove:
 - eval mode under torch.no_grad() works, records no gradient history, and is
   deterministic;
 - `build_model` from the YAML config gives the same architecture as the defaults.
+
+## Phase 6: data pipeline
+
+Built:
+- `data/transforms.py`: `CropToRetina` (cuts the black frame using a brightness
+  threshold), `PadToSquare` (keeps the round retina round), resize to 128, ImageNet
+  normalisation, and train-only augmentation (horizontal/vertical flips, rotation
+  up to 15 degrees, 10% brightness/contrast/saturation jitter, no hue). Comments
+  explain why random crops, random erasing and mixup are wrong for fundus images.
+- `data/eyepacs.py`: `read_eyepacs_labels()` (adds a `patient_id` column) and
+  `EyePACSDataset`, written from scratch on the three-method Dataset contract;
+  missing files are skipped with one warning; JPEG draft decoding for speed.
+- `data/messidor2.py`: `Messidor2Dataset`, evaluation only (loud warning at the
+  top); config-driven CSV column names; ungradable rows skipped.
+- `data/splits.py`: `split_by_patient()`, seeded, stratified by each patient's
+  worse-eye grade, both eyes always in the same split (no leakage).
+- `data/synthetic.py`: fake fundus JPEGs and CSVs in the real formats, for tests
+  and the laptop smoke test (never for reported results).
+- `data/__init__.py`: `build_dataloaders()` and `build_messidor_loader()`, with
+  batch_size / shuffle / num_workers / pin_memory explained; seeded shuffling.
+
+Tests (`tests/test_dataset.py`) prove, on synthetic JPEGs in a temp folder:
+- dataset length is right; an item is (3, 128, 128) with an int label in 0..4;
+- a deleted image is skipped with a warning and the rest still load;
+- the crop leaves exactly the bright region of a test image;
+- train/val/test are disjoint, cover every image, and share no patient;
+- the split is reproducible with the same seed and changes with another seed;
+- a DataLoader batch is (4, 3, 128, 128) with int64 labels;
+- Messidor-2 ungradable rows are dropped.

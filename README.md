@@ -24,7 +24,7 @@ no `timm`, no pretrained weights.
 - [x] Phase 3: selective scan
 - [x] Phase 4: bidirectional Vim block
 - [x] Phase 5: full model
-- [ ] Phase 6: data pipeline
+- [x] Phase 6: data pipeline
 - [ ] Phase 7: training
 - [ ] Phase 8: evaluation and figures
 - [ ] Phase 9: report and reading guide
