@@ -26,7 +26,7 @@ no `timm`, no pretrained weights.
 - [x] Phase 5: full model
 - [x] Phase 6: data pipeline
 - [x] Phase 7: training
-- [ ] Phase 8: evaluation and figures
+- [x] Phase 8: evaluation and figures
 - [ ] Phase 9: report and reading guide
 
 See `PROGRESS.md` for what each phase built and what its tests prove.

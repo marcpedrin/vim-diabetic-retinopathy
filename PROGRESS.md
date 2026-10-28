@@ -208,3 +208,25 @@ Tests prove:
 
 Manual check: `python -m train.train --smoke-test` with the full 12-block model on
 CPU takes ~21 s per epoch; loss 1.89 -> 1.70 over 2 epochs.
+
+## Phase 8: evaluation and figures
+
+Built:
+- `eval/metrics.py` and `tests/test_metrics.py` arrived in Phase 7 (see there).
+- `eval/evaluate.py`: loads a checkpoint, rebuilds the model AND the split settings
+  (seed, fractions) from the config stored inside it, evaluates the EyePACS test
+  split and Messidor-2 (skipped with a message if absent), prints a side-by-side
+  table (accuracy, QWK, macro P/R/F1, loss, per-grade recall), writes results.json
+  and one predictions CSV per dataset. The docstring names the expected
+  cross-dataset drop and its cause: domain shift (cameras, population, image
+  quality, reference standard).
+- `eval/plots.py`: five report figures into `report/figures/`:
+  training_curves.png (loss / accuracy / validation QWK, one measure per panel),
+  confusion_eyepacs_test.png and confusion_messidor2.png (row-normalised, one-hue
+  blue ramp, counts in cells), examples_eyepacs_test.png and examples_messidor2.png
+  (half wrong, half correct, verdict in words). Colour-blind-safe palette; figures
+  were rendered and inspected (fixed fractional epoch ticks and overlapping titles).
+
+Tests (`tests/test_evaluate_and_plots.py`) prove, end to end on synthetic data:
+train (2 epochs) -> evaluate (both datasets, every metric present, the ungradable
+Messidor-2 image skipped, JSON and CSVs written) -> plot (all five figures written).
