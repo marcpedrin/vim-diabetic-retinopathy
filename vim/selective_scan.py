@@ -210,26 +210,39 @@ def selective_scan(x, delta, A, B, C):
     # Step 3: walk along the row of tokens   [Algorithm 1, lines 18-22]
     # ---------------------------------------------------------------------------------
 
+    # Split every per-token tensor into its 65 tokens ONCE, before the loop.
+    # torch.unbind(t, dim=1) returns a tuple of 65 views, one per token, with the
+    # token dimension removed:
+    #   A_bar (Bt, 65, 384, 16) -> 65 x (Bt, 384, 16)   survival fractions
+    #   B_bar (Bt, 65, 384, 16) -> 65 x (Bt, 384, 16)   pour amounts
+    #   x     (Bt, 65, 384)     -> 65 x (Bt, 384)       each token's values
+    #   C     (Bt, 65, 16)      -> 65 x (Bt, 16)        each token's read gate
+    # So A_bar_steps[t] is exactly Algorithm 1's A_bar[:, i, :, :].
+    # Why not just write A_bar[:, t] inside the loop? The maths would be identical,
+    # but in the BACKWARD pass PyTorch would build a full-size (Bt, 65, 384, 16)
+    # gradient tensor, mostly zeros, for every one of the 65 indexing operations:
+    # 65 times the memory traffic. We measured a 2-block model's backward pass
+    # running about 10 times slower that way on a CPU. unbind's backward is one
+    # cheap `stack`. Same readability, no quadratic cost.
+    A_bar_steps = torch.unbind(A_bar, dim=1)
+    B_bar_steps = torch.unbind(B_bar, dim=1)
+    x_steps = torch.unbind(x, dim=1)
+    C_steps = torch.unbind(C, dim=1)
+
     # Algorithm 1, line 19: for i in {0, ..., M-1}.
     # PYTHON CONCEPT: `for t in range(seq_len):` is Java's
     # `for (int t = 0; t < seq_len; t++)`. range(65) produces 0, 1, ..., 64.
     # This loop is SEQUENTIAL: step t needs the h produced by step t-1.
     for t in range(seq_len):
-        # Pick out token t. Indexing a dimension with a single number REMOVES it:
-        #   A_bar[:, t]  (Bt, 65, 384, 16) -> (Bt, 384, 16)   survival fractions
-        #   B_bar[:, t]  (Bt, 65, 384, 16) -> (Bt, 384, 16)   pour amounts
-        #   x[:, t]      (Bt, 65, 384)     -> (Bt, 384)       this token's values
-        #   C[:, t]      (Bt, 65, 16)      -> (Bt, 16)        this token's read gate
-
         # The token's value must be poured into all 16 buckets of its channel, so
         # give it a trailing slot axis to broadcast over:
-        #   x[:, t] (Bt, 384) -> x_t (Bt, 384, 1)
-        x_t = x[:, t].unsqueeze(-1)
+        #   x_steps[t] (Bt, 384) -> x_t (Bt, 384, 1)
+        x_t = x_steps[t].unsqueeze(-1)
 
         # Algorithm 1, line 20: h = A_bar[:, i] (.) h + B_bar[:, i] (.) x[:, i, None]
         # This is Eq. 2's h_t = A_bar h_{t-1} + B_bar x_t.
-        #   A_bar[:, t] * h      (Bt, 384, 16) * (Bt, 384, 16) -> (Bt, 384, 16)  LEAK
-        #   B_bar[:, t] * x_t    (Bt, 384, 16) * (Bt, 384, 1)  -> (Bt, 384, 16)  POUR
+        #   A_bar_steps[t] * h    (Bt, 384, 16) * (Bt, 384, 16) -> (Bt, 384, 16)  LEAK
+        #   B_bar_steps[t] * x_t  (Bt, 384, 16) * (Bt, 384, 1)  -> (Bt, 384, 16)  POUR
         # When both shapes are equal, `*` is a plain elementwise product: every
         # bucket (b, e, n) is multiplied by its own survival fraction. In the second
         # product, x_t's size-1 slot axis is broadcast, so channel e's value is
@@ -237,12 +250,12 @@ def selective_scan(x, delta, A, B, C):
         # Note that A_bar is DIAGONAL in the paper's matrix language: bucket n only
         # ever leaks into itself, never into bucket m. That is why an elementwise
         # product is enough and no matrix multiplication is needed.
-        h = A_bar[:, t] * h + B_bar[:, t] * x_t
+        h = A_bar_steps[t] * h + B_bar_steps[t] * x_t
 
         # Algorithm 1, line 21: y[:, i] = h (x) C[:, i]. This is Eq. 2's y_t = C h_t.
         # C is shared by all channels, so give it a channel axis to broadcast over:
-        #   C[:, t] (Bt, 16) -> C_t (Bt, 1, 16)
-        C_t = C[:, t].unsqueeze(1)
+        #   C_steps[t] (Bt, 16) -> C_t (Bt, 1, 16)
+        C_t = C_steps[t].unsqueeze(1)
 
         # READ: weight each bucket by C, then add up the 16 buckets of each channel:
         #   h * C_t          (Bt, 384, 16) * (Bt, 1, 16) -> (Bt, 384, 16)

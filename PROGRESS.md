@@ -168,3 +168,43 @@ Tests (`tests/test_dataset.py`) prove, on synthetic JPEGs in a temp folder:
 - the split is reproducible with the same seed and changes with another seed;
 - a DataLoader batch is (4, 3, 128, 128) with int64 labels;
 - Messidor-2 ungradable rows are dropped.
+
+## Phase 7: training
+
+Built:
+- `train/engine.py`: `train_one_epoch()` (the five-step loop, zero_grad -> forward ->
+  loss -> backward -> step, with AMP autocast + GradScaler and gradient clipping;
+  scheduler stepped per batch) and `validate()` (`@torch.no_grad()`, eval mode,
+  returns loss, labels and predictions).
+- `train/train.py`: argparse (`--config`, repeatable `--override`, `--smoke-test`,
+  `--device`), seeding, loaders, model, inverse-frequency class-weighted
+  cross-entropy, AdamW (lr 1e-3, wd 0.05; no decay on biases, norms, E_pos, t_cls
+  and A_log), linear warmup + cosine schedule, per-epoch CSV log, `last.pt` every
+  epoch, `best.pt` on best validation QWK, and a copy of the config in the output
+  folder. `--smoke-test` = 2 epochs on 100 images (synthetic if EyePACS is absent),
+  written to `<output_dir>_smoke` so it can never overwrite a real run.
+- Deviations from Section 4.1 documented in the module docstring (30 vs 300 epochs,
+  batch 32 vs 1024, no mixup / random erasing / random crop / label smoothing /
+  EMA; added class weights, clipping, AMP).
+- `eval/metrics.py` (+ `tests/test_metrics.py`) was pulled forward from Phase 8,
+  because choosing the best checkpoint needs QWK. Everything is from scratch in
+  NumPy; QWK has the full formula, the weight matrix, and a worked example.
+
+Performance fix in `vim/selective_scan.py`: the loop now splits the per-token
+tensors once with `torch.unbind` instead of indexing `A_bar[:, t]` inside the loop.
+The backward pass of indexing allocates a full-size zero gradient at every step
+(quadratic memory traffic). Same maths, ~11x faster backward on CPU
+(2-block model, batch 8: 2.58 s -> 0.23 s).
+
+Tests prove:
+- `tests/test_train_smoke.py`: a real 2-epoch `--smoke-test` run through `main()`
+  on 100 synthetic images writes best.pt, last.pt, log.csv and config.yaml; the log
+  has 2 rows with finite losses; best.pt loads into a model rebuilt from the config
+  stored inside it; the schedule warms up to the peak, then decays monotonically to
+  near min_lr.
+- `tests/test_metrics.py`: confusion matrix, accuracy, per-class P/R/F1/support and
+  QWK equal scikit-learn's on 6 random label sets (3 imbalanced); the QWK worked
+  example gives 0.8 / 0.43 / -0.25; "always grade 0" gets ~72% accuracy but QWK 0.
+
+Manual check: `python -m train.train --smoke-test` with the full 12-block model on
+CPU takes ~21 s per epoch; loss 1.89 -> 1.70 over 2 epochs.
